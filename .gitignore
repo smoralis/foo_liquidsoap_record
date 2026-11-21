@@ -1,0 +1,8 @@
+/.vs
+/bin
+foo_liquidsoap_record.vcxproj.user
+/obj
+/packages
+/Release
+/Win32
+/x64
