@@ -40,7 +40,7 @@
 #endif
 
 DECLARE_COMPONENT_VERSION(
-    "Liquidsoap Record", "1.0.0",
+    "Liquidsoap Record", "1.0.1",
     "Record internet radio streams with Liquidsoap (record.liq).\n"
     "Requires a user-supplied liquidsoap executable and ffmpeg/ffprobe (path set in the window, or in PATH).");
 VALIDATE_COMPONENT_FILENAME("foo_liquidsoap_record.dll");
