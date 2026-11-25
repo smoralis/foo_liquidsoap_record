@@ -40,7 +40,7 @@
 #endif
 
 DECLARE_COMPONENT_VERSION(
-    "Liquidsoap Record", "1.0.1",
+    "Liquidsoap Record", "1.0.2",
     "Record internet radio streams with Liquidsoap (record.liq).\n"
     "Requires a user-supplied liquidsoap executable and ffmpeg/ffprobe (path set in the window, or in PATH).");
 VALIDATE_COMPONENT_FILENAME("foo_liquidsoap_record.dll");
@@ -154,6 +154,22 @@ namespace {
     };
     static const int N_FIELDS = (int)(sizeof(g_fields) / sizeof(g_fields[0]));
 
+    struct Section {
+        const wchar_t* title;
+        int tab; // 0 = Recording tab, 1 = Tools tab
+        const char* keys[12];
+    };
+    static const Section g_sections[] = {
+        {L"Stream", 0, {"url", "station", "directory"}},
+        {L"Recording", 0, {"format", "codec", "bitrate", "samplerate", "loglevel", "timeout", "tunein", "transcode"}},
+        {L"Options", 0, {"keep", "m3u", "covers", "single"}},
+        {L"Tools", 1, {"exe", "script", "ffmpeg", "ffprobe"}},
+        {L"Playback", 1, {"listen", "device"}},
+        {L"Icecast relay", 1, {"host", "port", "password", "relay"}},
+    };
+    static const int N_SECT = (int)(sizeof(g_sections) / sizeof(g_sections[0]));
+    static_assert(N_SECT + 1 <= 8, "raise View::sec size");
+
     static Field* find_field(const char* key) {
         for (auto& f : g_fields)
             if (!strcmp(f.key, key)) return &f;
@@ -258,30 +274,20 @@ namespace {
     static const UINT WM_APP_RELOAD = WM_APP + 3;
     static const UINT WM_APP_FORMAT = WM_APP + 4;
     static const UINT WM_APP_DESELECT = WM_APP + 5;
-    static const UINT WM_APP_CLEARLOG = WM_APP + 6;
 
     static std::vector<HWND> views_snapshot() {
         std::lock_guard<std::mutex> lk(g_views_mx);
         return g_views;
     }
 
-    // Shared log is mirrored by every view's edit box. Both sides use the same trim rule so they stay identical.
-    static const size_t LOG_MAX = 300000;  // trim when the text grows past this ...
-    static const size_t LOG_TRIM = 100000; // ... by dropping this many characters from the start
-
-    // Lock order everywhere: g_log_mx, then g_views_mx. The view list is snapshotted while g_log_mx is held, and a
-    // new view registers under g_log_mx too, so each log line reaches a view exactly once (via its initial text
-    // or via a posted message), never twice and never zero times.
     static void post_log(const std::wstring& line) {
-        std::vector<HWND> targets;
         {
             std::lock_guard<std::mutex> lk(g_log_mx);
             g_log += line;
             g_log += L"\r\n";
-            if (g_log.size() > LOG_MAX) g_log.erase(0, LOG_TRIM);
-            targets = views_snapshot();
+            if (g_log.size() > 300000) g_log.erase(0, 100000);
         }
-        for (HWND w : targets) {
+        for (HWND w : views_snapshot()) {
             auto* s = new std::wstring(line);
             if (!PostMessageW(w, WM_APP_LOG, 0, (LPARAM)s)) delete s;
         }
@@ -289,17 +295,6 @@ namespace {
 
     static void post_state() {
         for (HWND w : views_snapshot()) PostMessageW(w, WM_APP_STATE, 0, 0);
-    }
-
-    // wipe the shared log and ask every view to clear its log box
-    static void clear_log() {
-        std::vector<HWND> targets;
-        {
-            std::lock_guard<std::mutex> lk(g_log_mx);
-            g_log.clear();
-            targets = views_snapshot();
-        }
-        for (HWND w : targets) PostMessageW(w, WM_APP_CLEARLOG, 0, 0);
     }
 
     // ask every view except `except` to re-read the shared settings
@@ -334,14 +329,66 @@ namespace {
         }
     }
 
+    // Liquidsoap writes very long log lines (e.g. the "Using: ..." list) in several chunks and another
+    // thread's message can land in the middle of them:
+    //   "<start of A><complete message B>\n<rest of A>\n"
+    // A log record starts with "YYYY/MM/DD HH:MM:SS [". When such a stamp shows up in the middle of a
+    // line, the text before it is the unfinished start of an earlier record: emit B on its own and
+    // glue the rest of A back onto its start.
+    struct LineJoiner {
+        std::wstring pending; // start of an interrupted record
+
+        static bool ts_at(const std::wstring& s, size_t p) {
+            if (p + 21 > s.size()) return false;
+            static const char pat[] = "dddd/dd/dd dd:dd:dd [";
+            for (size_t i = 0; i < 21; ++i) {
+                wchar_t c = s[p + i];
+                if (pat[i] == 'd' ? !iswdigit(c) : c != (wchar_t)pat[i]) return false;
+            }
+            return true;
+        }
+        void flush() {
+            if (!pending.empty()) {
+                std::wstring t = pending;
+                pending.clear();
+                handle_line(t);
+            }
+        }
+        void feed(const std::wstring& L) {
+            bool starts = ts_at(L, 0);
+            size_t emb = std::wstring::npos;
+            for (size_t i = 1; i + 21 <= L.size(); ++i)
+                if (iswdigit(L[i]) && ts_at(L, i)) { emb = i; break; }
+
+            if (emb != std::wstring::npos) {
+                std::wstring head = L.substr(0, emb), msg = L.substr(emb);
+                if (starts) { flush(); pending = head; }          // new record that got interrupted
+                else if (!pending.empty()) pending += head;       // more of the interrupted record
+                else handle_line(head);                           // orphan piece, show as is
+                handle_line(msg);
+                return;
+            }
+            if (starts) { flush(); handle_line(L); return; }
+            if (!pending.empty()) {                               // the rest of the interrupted record
+                std::wstring t = pending + L;
+                pending.clear();
+                handle_line(t);
+                return;
+            }
+            handle_line(L);
+        }
+    };
+
     static void reader_thread(HANDLE rd, HANDLE proc) {
         std::string acc;
         char buf[4096];
+        LineJoiner lj;
+        int idle = 0;
         auto feed = [&](const char* d, DWORD n) {
             for (DWORD i = 0; i < n; ++i) {
                 if (d[i] == '\n') {
                     if (!acc.empty() && acc.back() == '\r') acc.pop_back();
-                    handle_line(WBytes(acc.data(), (int)acc.size()));
+                    lj.feed(WBytes(acc.data(), (int)acc.size()));
                     acc.clear();
                 }
                 else {
@@ -357,14 +404,17 @@ namespace {
                 DWORD want = avail < sizeof(buf) ? avail : (DWORD)sizeof(buf);
                 if (!ReadFile(rd, buf, want, &n, nullptr) || !n) break;
                 feed(buf, n);
+                idle = 0;
                 continue;
             }
             if (WaitForSingleObject(proc, 100) == WAIT_OBJECT_0) {
                 if (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail) continue;
                 break;
             }
+            if (++idle >= 2) lj.flush(); // the rest of an interrupted record never came
         }
-        if (!acc.empty()) handle_line(WBytes(acc.data(), (int)acc.size()));
+        if (!acc.empty()) lj.feed(WBytes(acc.data(), (int)acc.size()));
+        lj.flush();
         CloseHandle(rd);
 
         WaitForSingleObject(proc, INFINITE);
@@ -486,8 +536,6 @@ namespace {
         if (!build_cmd(cmd, script, err, false)) { post_log(L"[ERROR] " + err); return false; }
         std::wstring shown, s2, e2;
         build_cmd(shown, s2, e2, true);
-
-        clear_log(); // new recording starts with an empty log
 
         post_log(std::wstring(100, L'='));
         post_log(L"LIQUIDSOAP RECORD");
@@ -615,19 +663,6 @@ namespace {
         std::thread(stop_worker).detach();
     }
 
-    // Blocks until the running recording has fully ended (process exited, reader finished, g_running cleared).
-    // Call after stop_worker(): g_stopping clears when the process exits, but g_running only clears a moment later
-    // when the reader thread has drained the pipe.
-    static bool wait_until_ended(DWORD timeout_ms = 30000) {
-        DWORD t0 = GetTickCount();
-        while (g_running) {
-            if (GetTickCount() - t0 > timeout_ms) return false;
-            Sleep(50);
-        }
-        if (g_reader.joinable()) g_reader.join();
-        return true;
-    }
-
     static void shutdown_sync() {
         if (g_running) {
             if (!g_stopping.exchange(true)) stop_worker();
@@ -649,6 +684,9 @@ namespace {
         ID_COPY = 3003,
         ID_LOG = 3004,
         ID_STATUS = 3005,
+        ID_TAB0 = 3010,
+        ID_TAB1 = 3011,
+        ID_TAB2 = 3012,
     };
 
     static_assert(N_FIELDS <= 32, "raise View array sizes");
@@ -663,13 +701,19 @@ namespace {
         HWND btn[32] = {};
         HWND start = nullptr, stop = nullptr, copy = nullptr, status = nullptr;
         HWND log_lbl = nullptr, log = nullptr;
+        HWND sec[8] = {};     // section headers (last one = "Log")
+        RECT sec_line[8] = {}; // separator lines under them (client coords)
+        RECT top_box = {};     // frame around the Start/Stop/status area
+        HWND hot = nullptr;   // owner-drawn button under the mouse
+        int tab = 0;          // visible tab
+        HWND tabbtn[3] = {};
         // theme
         bool dark = false;
         COLORREF bg = 0, fg = 0, ebg = 0;
         HBRUSH bg_brush = nullptr, edit_brush = nullptr;
     };
 
-    static HFONT g_font = nullptr;
+    static HFONT g_font = nullptr, g_font_head = nullptr, g_font_mono = nullptr;
     static HWND g_popup = nullptr; // main thread only
     static const wchar_t* WND_CLASS = L"foo_liquidsoap_record_view";
 
@@ -835,30 +879,26 @@ namespace {
         EnableWindow(v->stop, g_running && !g_stopping);
     }
 
-    // Put the caret at the very end. NOTE: EM_SETSEL(-1,-1) only *removes the selection* and leaves the caret
-    // where it was (e.g. where the user last clicked), so EM_REPLACESEL would insert mid-text. Use the real length.
-    static void caret_to_end(HWND h) {
-        int len = GetWindowTextLengthW(h);
-        SendMessageW(h, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    }
-
-    // EM_SCROLLCARET is unreliable on an unfocused edit control; WM_VSCROLL/SB_BOTTOM is not.
-    static void scroll_log_to_end(HWND h) {
-        caret_to_end(h);
-        SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);
-        RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    // Keep the log scrolled to its last line. Only works while the control is visible and has its
+    // real size, so it is also called after layout and when the window / tab is shown.
+    static void scroll_log_end(View* v) {
+        if (!v || !v->log) return;
+        int len = GetWindowTextLengthW(v->log);
+        SendMessageW(v->log, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+        SendMessageW(v->log, EM_SCROLLCARET, 0, 0);
+        SendMessageW(v->log, WM_VSCROLL, SB_BOTTOM, 0);
     }
 
     static void append_log(View* v, const std::wstring& line) {
         if (!v->log) return;
-        caret_to_end(v->log);
-        std::wstring t = line + L"\r\n";
-        SendMessageW(v->log, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
-        if ((size_t)GetWindowTextLengthW(v->log) > LOG_MAX) { // same rule as post_log -> stays in sync with g_log
-            SendMessageW(v->log, EM_SETSEL, 0, (LPARAM)LOG_TRIM);
+        if (GetWindowTextLengthW(v->log) > 250000) {
+            SendMessageW(v->log, EM_SETSEL, 0, 100000);
             SendMessageW(v->log, EM_REPLACESEL, FALSE, (LPARAM)L"");
         }
-        scroll_log_to_end(v->log);
+        SendMessageW(v->log, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+        std::wstring t = line + L"\r\n";
+        SendMessageW(v->log, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
+        scroll_log_end(v);
     }
 
     static void browse(View* v, int idx) {
@@ -941,6 +981,31 @@ namespace {
         return TRUE;
     }
 
+    // Hover tracking for the owner-drawn buttons.
+    static LRESULT CALLBACK btn_hover_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+        View* v = (View*)ref;
+        switch (msg) {
+        case WM_MOUSEMOVE:
+            if (v && v->hot != h) {
+                v->hot = h;
+                TRACKMOUSEEVENT t{ sizeof(t), TME_LEAVE, h, 0 };
+                TrackMouseEvent(&t);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (v && v->hot == h) {
+                v->hot = nullptr;
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            break;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, btn_hover_proc, 2);
+            break;
+        }
+        return DefSubclassProc(h, msg, wp, lp);
+    }
+
     static void build_controls(View* v) {
         HINSTANCE inst = core_api::get_my_instance();
         auto mk = [&](DWORD ex, const wchar_t* cls, const wchar_t* text, DWORD st, int id) {
@@ -974,17 +1039,44 @@ namespace {
                 v->ctl[i] = mk(WS_EX_CLIENTEDGE, L"EDIT", L"", es, id);
             }
             if (f.kind == K_FILE_EXE || f.kind == K_FILE_LIQ || f.kind == K_DIR)
-                v->btn[i] = mk(0, L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP, ID_BROWSE + i);
+                v->btn[i] = mk(0, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, ID_BROWSE + i);
         }
-        v->start = mk(0, L"BUTTON", L"Start", BS_PUSHBUTTON | WS_TABSTOP, ID_START);
-        v->stop = mk(0, L"BUTTON", L"Stop", BS_PUSHBUTTON | WS_TABSTOP, ID_STOP);
-        v->copy = mk(0, L"BUTTON", L"Copy command", BS_PUSHBUTTON | WS_TABSTOP, ID_COPY);
-        v->status = mk(0, L"STATIC", L"Idle", SS_LEFT | SS_ENDELLIPSIS, ID_STATUS);
+        v->start = mk(0, L"BUTTON", L"Start", BS_OWNERDRAW | WS_TABSTOP, ID_START);
+        v->stop = mk(0, L"BUTTON", L"Stop", BS_OWNERDRAW | WS_TABSTOP, ID_STOP);
+        v->copy = mk(0, L"BUTTON", L"Copy command", BS_OWNERDRAW | WS_TABSTOP, ID_COPY);
+        v->status = mk(0, L"STATIC", L"Idle", SS_CENTER | SS_ENDELLIPSIS, ID_STATUS);
         v->log_lbl = mk(0, L"STATIC", L"Log", SS_LEFT, -1);
         v->log = mk(WS_EX_CLIENTEDGE, L"EDIT", L"",
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, ID_LOG);
         SendMessageW(v->log, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
+        for (int sidx = 0; sidx < N_SECT; ++sidx) v->sec[sidx] = mk(0, L"STATIC", g_sections[sidx].title, SS_LEFT, -1);
+        v->sec[N_SECT] = v->log_lbl;
+        v->tabbtn[0] = mk(0, L"BUTTON", L"Recording", BS_OWNERDRAW | WS_TABSTOP, ID_TAB0);
+        v->tabbtn[1] = mk(0, L"BUTTON", L"Tools", BS_OWNERDRAW | WS_TABSTOP, ID_TAB1);
+        v->tabbtn[2] = mk(0, L"BUTTON", L"Log", BS_OWNERDRAW | WS_TABSTOP, ID_TAB2);
+
         EnumChildWindows(v->wnd, set_font_proc, (LPARAM)g_font);
+        for (int sidx = 0; sidx <= N_SECT; ++sidx) SendMessageW(v->sec[sidx], WM_SETFONT, (WPARAM)g_font_head, TRUE);
+        SendMessageW(v->log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+
+        // a little inner padding in the text boxes
+        for (int i = 0; i < N_FIELDS; ++i) {
+            Kind k = g_fields[i].kind;
+            if (k == K_CHECK) continue;
+            HWND e = v->ctl[i];
+            if (is_combo(k)) {
+                COMBOBOXINFO ci{};
+                ci.cbSize = sizeof(ci);
+                e = (GetComboBoxInfo(v->ctl[i], &ci) && ci.hwndItem) ? ci.hwndItem : nullptr;
+            }
+            if (e) SendMessageW(e, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(5, 5));
+        }
+        SendMessageW(v->log, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
+
+        HWND bs[] = { v->start, v->stop, v->copy, v->tabbtn[0], v->tabbtn[1], v->tabbtn[2] };
+        for (HWND b : bs) SetWindowSubclass(b, btn_hover_proc, 2, (DWORD_PTR)v);
+        for (int i = 0; i < N_FIELDS; ++i)
+            if (v->btn[i]) SetWindowSubclass(v->btn[i], btn_hover_proc, 2, (DWORD_PTR)v);
     }
 
     // Responsive layout: 1 or 2 columns by width, log fills the rest, vertical scroll if too small.
@@ -997,62 +1089,115 @@ namespace {
             int Wd = rc.right, H = rc.bottom;
             if (Wd < 60 || H < 60) break;
 
-            const int M = 10, ROW = 28, LABEL_W = 100, BTN_W = 76;
-            int ncols = Wd >= 560 ? 2 : 1;
-            int colW = (Wd - (ncols + 1) * M) / ncols;
+            const int M = 14, ROW = 30, CHK = 24, LABEL_W = 112, BTN_W = 84, EH = 24, GAP = 24, BH = 30;
+            int ncols = Wd >= 620 ? 2 : 1;
+            int colW = (Wd - 2 * M - (ncols - 1) * GAP) / ncols;
 
             HDWP dwp = BeginDeferWindowPos(128);
+            bool curvis = true;
             auto put = [&](HWND h, int x, int yy, int w, int hh) {
                 if (h && dwp)
-                    dwp = DeferWindowPos(dwp, h, nullptr, x, yy - v->scroll, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+                    dwp = DeferWindowPos(dwp, h, nullptr, x, yy - v->scroll, w, hh,
+                        SWP_NOZORDER | SWP_NOACTIVATE | (curvis ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
                 };
             auto place = [&](int i, int x, int y, int w) {
                 Field& f = g_fields[i];
                 if (f.kind == K_CHECK) { put(v->ctl[i], x, y, w, 22); return; }
-                put(v->lbl[i], x, y + 4, LABEL_W - 5, 20);
+                put(v->lbl[i], x, y + 4, LABEL_W - 6, 20);
                 int cx = x + LABEL_W, cw = w - LABEL_W;
-                if (v->btn[i]) cw -= BTN_W + 6;
+                if (v->btn[i]) cw -= BTN_W + 8;
                 if (cw < 40) cw = 40;
-                put(v->ctl[i], cx, y, cw, is_combo(f.kind) ? 200 : 22);
-                if (v->btn[i]) put(v->btn[i], cx + cw + 6, y - 1, BTN_W, 24);
+                // boxes only as wide as their content needs
+                int maxw = f.wide ? 460 : is_combo(f.kind) ? 150
+                    : (!strcmp(f.key, "timeout") || !strcmp(f.key, "port") || !strcmp(f.key, "tunein")) ? 110
+                    : 200;
+                if (cw > maxw) cw = maxw;
+                put(v->ctl[i], cx, y, cw, is_combo(f.kind) ? 200 : EH);
+                if (v->btn[i]) put(v->btn[i], cx + cw + 8, y - 1, BTN_W, EH + 2);
                 };
 
+            RECT nline[8] = {};
             int yy = M;
-            for (int i = 0; i < N_FIELDS; ++i)
-                if (g_fields[i].wide) { place(i, M, yy, Wd - 2 * M); yy += ROW; }
+            auto header = [&](int sidx, HWND h) {
+                put(h, M, yy, Wd - 2 * M, 20);
+                int ly = yy + 21;
+                if (curvis) nline[sidx] = { M, ly - v->scroll, Wd - M, ly + 1 - v->scroll };
+                yy += 28;
+                };
 
-            int col = 0;
-            for (int i = 0; i < N_FIELDS; ++i) {
-                if (g_fields[i].wide || g_fields[i].kind == K_CHECK) continue;
-                place(i, M + col * (colW + M), yy, colW);
-                if (++col == ncols) { col = 0; yy += ROW; }
+            // Start / Stop / Copy and the status line stay at the very top, above the tabs
+            const int PAD = 10, BOXH = PAD + BH + 8 + 20 + PAD;
+            RECT nbox = { M, yy - v->scroll, Wd - M, yy + BOXH - v->scroll };
+            int bx = (Wd - 332) / 2; // 96 + 8 + 96 + 8 + 124, centred in the box
+            if (bx < M + PAD) bx = M + PAD;
+            put(v->start, bx, yy + PAD, 96, BH);
+            put(v->stop, bx + 104, yy + PAD, 96, BH);
+            put(v->copy, bx + 208, yy + PAD, 124, BH);
+            put(v->status, M + PAD, yy + PAD + BH + 8, Wd - 2 * M - 2 * PAD, 20);
+            yy += BOXH + 14;
+
+            // tab strip, with a full-width line under it
+            int tx = (Wd - 248) / 2; // 104 + 4 + 76 + 4 + 60, centred
+            if (tx < M) tx = M;
+            put(v->tabbtn[0], tx, yy, 104, 30);
+            put(v->tabbtn[1], tx + 108, yy, 76, 30);
+            put(v->tabbtn[2], tx + 188, yy, 60, 30);
+            nline[7] = { 0, yy + 31 - v->scroll, Wd, yy + 32 - v->scroll };
+            yy += 44;
+            const int content_top = yy;
+
+            for (int sidx = 0; sidx < N_SECT; ++sidx) {
+                curvis = (g_sections[sidx].tab == v->tab);
+                int ysave = yy;
+                if (curvis && sidx && yy > content_top) yy += 6;
+                header(sidx, v->sec[sidx]);
+                int col = 0, rh = 0;
+                for (int k = 0; k < 12 && g_sections[sidx].keys[k]; ++k) {
+                    Field* f = find_field(g_sections[sidx].keys[k]);
+                    if (!f) continue;
+                    int i = (int)(f - g_fields);
+                    if (f->wide) {
+                        if (col) { col = 0; yy += rh; rh = 0; }
+                        place(i, M, yy, Wd - 2 * M);
+                        yy += ROW;
+                        continue;
+                    }
+                    int h = f->kind == K_CHECK ? CHK : ROW;
+                    if (h > rh) rh = h;
+                    place(i, M + col * (colW + GAP), yy, colW);
+                    if (++col == ncols) { col = 0; yy += rh; rh = 0; }
+                }
+                if (col) yy += rh;
+                if (!curvis) yy = ysave; // hidden tab: takes no room
             }
-            if (col) yy += ROW;
+            yy += 10;
 
-            col = 0;
-            for (int i = 0; i < N_FIELDS; ++i) {
-                if (g_fields[i].kind != K_CHECK) continue;
-                place(i, M + col * (colW + M), yy, colW);
-                if (++col == ncols) { col = 0; yy += 24; }
+            int total;
+            {
+                curvis = false;
+                put(v->log_lbl, 0, 0, 10, 10);
+                bool tl = v->tab == 2;
+                int logH = H - content_top - M;
+                if (logH < 100) logH = 100;
+                curvis = tl;
+                put(v->log, tl ? M : 0, tl ? content_top : 0, tl ? Wd - 2 * M : 10, tl ? logH : 10);
+                total = tl ? content_top + logH + M : yy + M;
             }
-            if (col) yy += 24;
-            yy += 8;
-
-            put(v->start, M, yy, 90, 26);
-            put(v->stop, M + 96, yy, 90, 26);
-            put(v->copy, M + 192, yy, 110, 26);
-            int sw = Wd - M - (M + 312);
-            put(v->status, M + 312, yy + 5, sw < 40 ? 40 : sw, 20);
-            yy += 32;
-
-            put(v->log_lbl, M, yy, 100, 20);
-            yy += 22;
-            int logH = H - yy - M;
-            if (logH < 120) logH = 120;
-            put(v->log, M, yy, Wd - 2 * M, logH);
-            int total = yy + logH + M;
 
             if (dwp) EndDeferWindowPos(dwp);
+            if (v->tab == 2) scroll_log_end(v); // log tab: always show the newest line
+
+            bool lines_changed = false;
+            for (int sidx = 0; sidx < 8; ++sidx)
+                if (memcmp(&v->sec_line[sidx], &nline[sidx], sizeof(RECT)) != 0) {
+                    v->sec_line[sidx] = nline[sidx];
+                    lines_changed = true;
+                }
+            if (memcmp(&v->top_box, &nbox, sizeof(RECT)) != 0) {
+                v->top_box = nbox;
+                lines_changed = true;
+            }
+            if (lines_changed) InvalidateRect(v->wnd, nullptr, TRUE);
 
             int maxpos = total - H;
             if (maxpos < 0) maxpos = 0;
@@ -1119,6 +1264,12 @@ namespace {
         return RGB(f(GetRValue(c)), f(GetGValue(c)), f(GetBValue(c)));
     }
 
+    // a + (b - a) * pct / 100, per channel
+    static COLORREF mix(COLORREF a, COLORREF b, int pct) {
+        auto f = [&](int x, int y) { return x + (y - x) * pct / 100; };
+        return RGB(f(GetRValue(a), GetRValue(b)), f(GetGValue(a), GetGValue(b)), f(GetBValue(a), GetBValue(b)));
+    }
+
     static bool query_host_colors(View* v, COLORREF& bg, COLORREF& fg) {
         HWND parent = v->popup ? core_api::get_main_window() : GetParent(v->wnd);
         if (!sample_host_background(parent, bg)) return false;
@@ -1175,6 +1326,84 @@ namespace {
         if (b != v->bg || f != v->fg) apply_theme(v);
     }
 
+    // Flat, rounded buttons; Start is the accent button.
+    static void draw_button(View* v, DRAWITEMSTRUCT* d) {
+        HDC dc = d->hDC;
+        RECT r = d->rcItem;
+        for (int t = 0; t < 3; ++t) {
+            if (d->hwndItem != v->tabbtn[t]) continue;
+            bool sel = v->tab == t, hot = v->hot == d->hwndItem;
+            if (v->bg_brush) FillRect(dc, &r, v->bg_brush);
+            COLORREF tc = sel || hot ? v->fg : mix(v->bg, v->fg, 62);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, tc);
+            HGDIOBJ of = SelectObject(dc, g_font_head);
+            wchar_t tt[32] = L"";
+            GetWindowTextW(d->hwndItem, tt, 32);
+            RECT tr = r;
+            DrawTextW(dc, tt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dc, of);
+            if (sel) {
+                HBRUSH ab = CreateSolidBrush(v->dark ? RGB(76, 194, 255) : RGB(0, 103, 192));
+                RECT ur = { r.left + 6, r.bottom - 3, r.right - 6, r.bottom };
+                FillRect(dc, &ur, ab);
+                DeleteObject(ab);
+            }
+            return;
+        }
+        bool down = (d->itemState & ODS_SELECTED) != 0, dis = (d->itemState & ODS_DISABLED) != 0;
+        bool hot = v->hot == d->hwndItem && !dis;
+        bool accent = d->hwndItem == v->start && !dis;
+        COLORREF face, border, text, accent_c = v->dark ? RGB(76, 194, 255) : RGB(0, 103, 192);
+        if (accent) {
+            if (v->dark) {
+                face = down ? RGB(58, 150, 205) : hot ? RGB(112, 210, 255) : accent_c;
+                text = RGB(0, 0, 0);
+            }
+            else {
+                face = down ? RGB(0, 84, 160) : hot ? RGB(24, 118, 197) : accent_c;
+                text = RGB(255, 255, 255);
+            }
+            border = face;
+        }
+        else if (v->dark) {
+            face = lighten(v->bg, down ? 5 : hot ? 18 : 10);
+            border = lighten(v->bg, 24);
+            text = dis ? RGB(125, 125, 125) : v->fg;
+        }
+        else {
+            face = down ? RGB(222, 222, 222) : hot ? RGB(232, 232, 232) : dis ? RGB(248, 248, 248) : RGB(243, 243, 243);
+            border = RGB(209, 209, 209);
+            text = dis ? (COLORREF)GetSysColor(COLOR_GRAYTEXT) : v->fg;
+        }
+        if (v->bg_brush) FillRect(dc, &r, v->bg_brush);
+        HPEN pen = CreatePen(PS_SOLID, 1, border);
+        HBRUSH br = CreateSolidBrush(face);
+        HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, br);
+        RoundRect(dc, r.left, r.top, r.right, r.bottom, 8, 8);
+        if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+            HPEN fp = CreatePen(PS_SOLID, 1, accent ? text : accent_c);
+            SelectObject(dc, fp);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            RoundRect(dc, r.left + 2, r.top + 2, r.right - 2, r.bottom - 2, 5, 5);
+            SelectObject(dc, pen);
+            DeleteObject(fp);
+        }
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(pen);
+        DeleteObject(br);
+
+        wchar_t t[64] = L"";
+        GetWindowTextW(d->hwndItem, t, 64);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, text);
+        HGDIOBJ of = SelectObject(dc, g_font);
+        if (down) OffsetRect(&r, 0, 1);
+        DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, of);
+    }
+
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         View* v = (msg == WM_CREATE || msg == WM_NCCREATE) ? nullptr : V(hwnd);
         switch (msg) {
@@ -1190,13 +1419,14 @@ namespace {
             for (int i = 0; i < N_FIELDS; ++i)
                 if (is_combo(g_fields[i].kind)) PostMessageW(hwnd, WM_APP_DESELECT, 0, (LPARAM)nv->ctl[i]);
             {
-                // snapshot the log and register under the same lock so no line is lost or doubled
                 std::lock_guard<std::mutex> lk(g_log_mx);
                 SetWindowTextW(nv->log, g_log.c_str());
-                std::lock_guard<std::mutex> lk2(g_views_mx);
+            }
+            scroll_log_end(nv);
+            {
+                std::lock_guard<std::mutex> lk(g_views_mx);
                 g_views.push_back(hwnd);
             }
-            scroll_log_to_end(nv->log);
             SetTimer(hwnd, 1, 1000, nullptr);
             update_status(nv);
             return 0;
@@ -1206,7 +1436,25 @@ namespace {
                 RECT r;
                 GetClientRect(hwnd, &r);
                 FillRect((HDC)wp, &r, v->bg_brush);
+                HBRUSH lb = CreateSolidBrush(mix(v->bg, v->fg, 20));
+                for (int i = 0; i < 8; ++i)
+                    if (v->sec_line[i].right > v->sec_line[i].left) FillRect((HDC)wp, &v->sec_line[i], lb);
+                DeleteObject(lb);
+                if (v->top_box.right > v->top_box.left) { // frame around the top controls
+                    HPEN bp = CreatePen(PS_SOLID, 1, mix(v->bg, v->fg, 28));
+                    HGDIOBJ op = SelectObject((HDC)wp, bp), ob = SelectObject((HDC)wp, GetStockObject(NULL_BRUSH));
+                    RoundRect((HDC)wp, v->top_box.left, v->top_box.top, v->top_box.right, v->top_box.bottom, 10, 10);
+                    SelectObject((HDC)wp, op);
+                    SelectObject((HDC)wp, ob);
+                    DeleteObject(bp);
+                }
                 return 1;
+            }
+            break;
+        case WM_DRAWITEM:
+            if (v && lp && ((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) {
+                draw_button(v, (DRAWITEMSTRUCT*)lp);
+                return TRUE;
             }
             break;
         case WM_CTLCOLORSTATIC:
@@ -1229,7 +1477,10 @@ namespace {
                     SetBkColor(dc, v->ebg);
                     return (LRESULT)v->edit_brush;
                 }
-                SetTextColor(dc, v->fg);
+                COLORREF tc = v->fg;
+                for (int i = 0; i < N_FIELDS; ++i)
+                    if (v->lbl[i] && (HWND)lp == v->lbl[i]) { tc = mix(v->bg, v->fg, 68); break; } // muted field labels
+                SetTextColor(dc, tc);
                 SetBkColor(dc, v->bg);
                 return (LRESULT)v->bg_brush;
             }
@@ -1253,10 +1504,13 @@ namespace {
             if (v && v->popup) save_popup_placement(hwnd);
             break;
         case WM_SHOWWINDOW:
-            if (v && wp)
+            if (v && wp) {
                 for (int i = 0; i < N_FIELDS; ++i)
                     if (is_combo(g_fields[i].kind) && v->ctl[i] && GetFocus() != v->ctl[i])
                         PostMessageW(hwnd, WM_APP_DESELECT, 0, (LPARAM)v->ctl[i]);
+                layout(v);
+                if (v->tab == 2) scroll_log_end(v);
+            }
             break;
         case WM_VSCROLL: {
             if (!v) break;
@@ -1294,6 +1548,14 @@ namespace {
                 save_from_controls(v);
                 reload_all(hwnd);
                 start_recording();
+                return 0;
+            }
+            if ((id == ID_TAB0 || id == ID_TAB1 || id == ID_TAB2) && code == BN_CLICKED) {
+                v->tab = id == ID_TAB2 ? 2 : id == ID_TAB1 ? 1 : 0;
+                v->scroll = 0;
+                layout(v);
+                InvalidateRect(v->wnd, nullptr, TRUE);
+                for (HWND tb : v->tabbtn) InvalidateRect(tb, nullptr, FALSE);
                 return 0;
             }
             if (id == ID_STOP && code == BN_CLICKED) { stop_recording_async(); return 0; }
@@ -1343,9 +1605,6 @@ namespace {
         case WM_APP_RELOAD:
             if (v) load_to_controls(v);
             return 0;
-        case WM_APP_CLEARLOG:
-            if (v && v->log) SetWindowTextW(v->log, L"");
-            return 0;
         case WM_APP_LOG: {
             std::unique_ptr<std::wstring> s((std::wstring*)lp);
             if (v) append_log(v, *s);
@@ -1365,7 +1624,15 @@ namespace {
             if (v && v->popup) {
                 save_from_controls(v);
                 save_popup_placement(hwnd);
-                ShowWindow(hwnd, SW_HIDE); // keep window (and recording) alive
+                // Hide (keeps the window and the recording alive) and hand the focus back to foobar2000;
+                // otherwise Windows may activate some other application's window.
+                HWND fg = GetForegroundWindow();
+                bool was_active = fg == hwnd || (fg && GetWindow(fg, GW_OWNER) == hwnd) || GetActiveWindow() == hwnd;
+                ShowWindow(hwnd, SW_HIDE);
+                if (was_active) {
+                    HWND mw = core_api::get_main_window();
+                    if (mw && IsWindow(mw) && !IsIconic(mw)) SetForegroundWindow(mw);
+                }
                 return 0;
             }
             break;
@@ -1411,6 +1678,12 @@ namespace {
             ncm.cbSize = sizeof(ncm);
             SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
             g_font = CreateFontIndirectW(&ncm.lfMessageFont);
+            LOGFONTW hf = ncm.lfMessageFont;
+            hf.lfWeight = FW_SEMIBOLD;
+            g_font_head = CreateFontIndirectW(&hf);
+            LOGFONTW mf = ncm.lfMessageFont;
+            wcscpy_s(mf.lfFaceName, L"Consolas");
+            g_font_mono = CreateFontIndirectW(&mf);
         }
     }
 
@@ -1437,15 +1710,29 @@ namespace {
         g_popup = CreateWindowExW(WS_EX_CONTROLPARENT, WND_CLASS, L"Liquidsoap Record",
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL,
             have_pos ? pr.left : CW_USEDEFAULT, have_pos ? pr.top : CW_USEDEFAULT,
-            have_pos ? pr.right - pr.left : 740, have_pos ? pr.bottom - pr.top : 800,
+            have_pos ? pr.right - pr.left : 780, have_pos ? pr.bottom - pr.top : 840,
             core_api::get_main_window(), nullptr, core_api::get_my_instance(),
             (LPVOID)(INT_PTR)1);
         if (!g_popup) return;
-        {   // no icon in the title bar
-            WTA_OPTIONS o{};
-            o.dwFlags = WTNCA_NODRAWICON;
-            o.dwMask = WTNCA_NODRAWICON;
-            SetWindowThemeAttribute(g_popup, WTA_NONCLIENT, &o, sizeof(o));
+        {   // foobar2000's own icon in the title bar (shared handles, nothing to free)
+            HWND mw = core_api::get_main_window();
+            HICON big = mw ? (HICON)SendMessageW(mw, WM_GETICON, ICON_BIG, 0) : nullptr;
+            HICON sm = mw ? (HICON)SendMessageW(mw, WM_GETICON, ICON_SMALL2, 0) : nullptr;
+            if (!big && mw) big = (HICON)GetClassLongPtrW(mw, GCLP_HICON);
+            if (!sm && mw) sm = (HICON)GetClassLongPtrW(mw, GCLP_HICONSM);
+            if (!big || !sm) { // fall back to the icon of foobar2000.exe
+                static HICON exe_big = nullptr, exe_small = nullptr;
+                if (!exe_small) {
+                    wchar_t exe[MAX_PATH] = L"";
+                    if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) ExtractIconExW(exe, 0, &exe_big, &exe_small, 1);
+                }
+                if (!big) big = exe_big;
+                if (!sm) sm = exe_small;
+            }
+            if (!sm) sm = big;
+            if (!big) big = sm;
+            if (sm) SendMessageW(g_popup, WM_SETICON, ICON_SMALL, (LPARAM)sm);
+            if (big) SendMessageW(g_popup, WM_SETICON, ICON_BIG, (LPARAM)big);
         }
         modeless_dialog_manager::g_add(g_popup);
         ShowWindow(g_popup, (have_pos && pmax) ? SW_SHOWMAXIMIZED : SW_SHOW);
@@ -1698,7 +1985,7 @@ namespace {
     public:
         t_uint32 get_command_count() override { return 1; }
         GUID get_command(t_uint32) override { return guid_menu; }
-        void get_name(t_uint32, pfc::string_base& out) override { out = "Liquidsoap Record"; }
+        void get_name(t_uint32, pfc::string_base& out) override { out = "Liquidsoap Record..."; }
         bool get_description(t_uint32, pfc::string_base& out) override {
             out = "Open the Liquidsoap stream recorder.";
             return true;
@@ -1863,16 +2150,10 @@ namespace {
                     if (!g_stopping.exchange(true)) stop_worker();
                     while (g_stopping) Sleep(50);
                 }
-                // wait for the previous recording to end completely before starting the new one
-                if (!wait_until_ended()) {
-                    post_log(L"[GUI] Previous recording did not end in time; new recording not started.");
-                    return;
-                }
             }
 
             c_url.set_string(si.url.c_str());
-            // Station name comes from the stub's "name"; it is cleared when there is none and for plain http(s) URLs.
-            c_station.set_string(is_stream_path(path) ? "" : si.name.c_str());
+            if (!is_stream_path(path)) c_station.set_string(si.name.c_str()); // stub: name from "name" (empty if none)
             reload_all(nullptr);
             show_ui();
             if (i == 1) start_recording();
